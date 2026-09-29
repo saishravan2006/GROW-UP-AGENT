@@ -337,6 +337,39 @@ def test_clarification_resumed_query():
     assert pm.get_pending_clarification() is None
     print("[PASS] 12. Selected entity successfully injected into resumed query")
 
+# ================================================================
+# 13. Propose Schema explicit tool
+# ================================================================
+def test_propose_schema():
+    _, _, agent = setup_fresh()
+    
+    # Check that Loves is rejected initially
+    agent._handle_tool_call("get_schema", {}, "u_test")
+    res_err = json.loads(agent._handle_tool_call(
+        "learn_fact", {"metta_atom": "(Loves Alice Bob)"}, "u_test"
+    ))
+    assert res_err["status"] == "error"
+    assert "propose a new schema explicitly" in res_err["message"]
+    
+    # Propose the schema
+    res_prop = json.loads(agent._handle_tool_call(
+        "propose_schema", {
+            "predicate_name": "Loves", 
+            "argument_types": ["Person", "Person"], 
+            "meaning": "Affection"
+        }, "u_test"
+    ))
+    assert res_prop["status"] == "success"
+    
+    # Now it should be accepted
+    # Must call get_schema first due to check
+    agent._handle_tool_call("get_schema", {}, "u_test")
+    res_learn = json.loads(agent._handle_tool_call(
+        "learn_fact", {"metta_atom": "(Loves Alice Bob)"}, "u_test"
+    ))
+    assert res_learn["status"] == "success"
+    print("[PASS] 13. propose_schema successfully registers new predicates")
+
 
 if __name__ == "__main__":
     print("\n=== Stage A/B Guarantee Tests ===\n")
@@ -352,4 +385,5 @@ if __name__ == "__main__":
     test_derivation_record_structure()
     test_independent_rule_variables()
     test_clarification_resumed_query()
-    print("\n=== ALL 12 TESTS PASSED ===\n")
+    test_propose_schema()
+    print("\n=== ALL 13 TESTS PASSED ===\n")

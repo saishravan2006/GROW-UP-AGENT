@@ -79,6 +79,22 @@ class NeuroSymbolicAgent:
             {
                 "type": "function",
                 "function": {
+                    "name": "propose_schema",
+                    "description": "Propose a new schema predicate when you encounter a concept that cannot be expressed using the existing schema. This explicitly defines the predicate's meaning and arguments.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "predicate_name": {"type": "string", "description": "PascalCase name of the new predicate (e.g. Loves)"},
+                            "argument_types": {"type": "array", "items": {"type": "string"}, "description": "List of expected arguments (e.g. ['Person', 'Person'])"},
+                            "meaning": {"type": "string", "description": "A clear definition of what this predicate represents."}
+                        },
+                        "required": ["predicate_name", "argument_types", "meaning"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "query_knowledge",
                     "description": "Executes a MeTTa query against the AtomSpace. Example: (Location AISecurityHackathon $x)",
                     "parameters": {
@@ -137,8 +153,12 @@ class NeuroSymbolicAgent:
                 import re as _re
                 # Match facts like (RequiresClearance ...)
                 m1 = _re.match(r"^\(\s*([a-zA-Z0-9_]+)\s", atom)
-                if m1 and m1.group(1) != "=":
-                    predicates.add(m1.group(1))
+                if m1 and m1.group(1) not in ("=", ":"):
+                    if m1.group(1) == "SchemaDefinition":
+                        m_def = _re.match(r"^\(\s*SchemaDefinition\s+([a-zA-Z0-9_]+)\s", atom)
+                        if m_def: predicates.add(m_def.group(1))
+                    else:
+                        predicates.add(m1.group(1))
                 # Match rules like (= (CanAccess ...) ...)
                 m2 = _re.match(r"^\(\=\s*\(\s*([a-zA-Z0-9_]+)\s", atom)
                 if m2:
@@ -147,6 +167,32 @@ class NeuroSymbolicAgent:
             if not predicates:
                 return json.dumps({"status": "success", "schema": "Schema is currently empty. You may define new predicates."})
             return json.dumps({"status": "success", "schema": list(predicates)})
+            
+        elif name == "propose_schema":
+            pred = args.get("predicate_name")
+            args_types = args.get("argument_types", [])
+            meaning = args.get("meaning")
+            
+            if not pred or not pred.istitle() or not pred.isalnum():
+                return json.dumps({"status": "error", "message": "Predicate must be valid PascalCase."})
+                
+            # Write a SchemaDefinition atom to the DB
+            types_str = " ".join(args_types) if args_types else "Entity"
+            schema_atom = f'(SchemaDefinition {pred} "{types_str}" "{meaning}")'
+            
+            import hashlib
+            op_id = "op_schema_" + hashlib.sha256(f"{user_input}:{schema_atom}".encode()).hexdigest()[:12]
+            
+            if self.pm.operation_exists(op_id):
+                return json.dumps({"status": "success", "message": f"Duplicate schema operation skipped."})
+                
+            self.engine.add_atom(schema_atom)
+            self.pm.record_modification(self.engine, user_input, schema_atom, "add", op_id=op_id)
+            
+            return json.dumps({
+                "status": "success", 
+                "message": f"Successfully registered new predicate '{pred}'. You may now use it in learn_fact."
+            })
             
         elif name == "query_knowledge":
             query = args.get("metta_query", "")
@@ -229,7 +275,11 @@ class NeuroSymbolicAgent:
                 for existing in self.engine.get_all_atoms():
                     m1 = _re.match(r"^\(\s*([a-zA-Z0-9_]+)\s", existing)
                     if m1 and m1.group(1) not in ("=", ":"):
-                        known_preds.add(m1.group(1))
+                        if m1.group(1) == "SchemaDefinition":
+                            m_def = _re.match(r"^\(\s*SchemaDefinition\s+([a-zA-Z0-9_]+)\s", existing)
+                            if m_def: known_preds.add(m_def.group(1))
+                        else:
+                            known_preds.add(m1.group(1))
                         
                 if predicate not in known_preds:
                     return json.dumps({
