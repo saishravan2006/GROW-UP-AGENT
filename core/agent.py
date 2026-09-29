@@ -363,13 +363,17 @@ class NeuroSymbolicAgent:
         
         # 3. Slow Brain (Gemini) executes with tools
         for _ in range(5):
-            response = self.client.chat.completions.create(
+            try:
+                response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
                 tools=self.tools,
                 tool_choice="auto",
                 temperature=0.3
             )
+            except Exception as e:
+                logger.error(f"LLM API Error: {e}")
+                return f"My brain just disconnected (API Error). Can we try that again?"
             
             msg = response.choices[0].message
             messages.append(msg)
