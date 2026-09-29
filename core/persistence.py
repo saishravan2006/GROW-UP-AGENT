@@ -57,6 +57,15 @@ class PersistenceManager:
                 FOREIGN KEY(utterance_id) REFERENCES utterances(id)
             )
         """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pending_clarifications (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                original_text TEXT,
+                status TEXT,
+                timestamp REAL
+            )
+        """)
         self._conn.commit()
         
     def load_state(self, engine: MeTTaEngine) -> bool:
@@ -132,6 +141,32 @@ class PersistenceManager:
         cursor.execute("SELECT text FROM utterances WHERE id = ?", (utterance_id,))
         row = cursor.fetchone()
         return row["text"] if row else None
+        
+    def record_pending_clarification(self, text: str) -> str:
+        """Records a user input that requires clarification."""
+        c_id = f"clar_{uuid.uuid4().hex[:8]}"
+        cursor = self._conn.cursor()
+        cursor.execute(
+            "INSERT INTO pending_clarifications (id, session_id, original_text, status, timestamp) VALUES (?, ?, ?, ?, ?)",
+            (c_id, self.session_id, text, "pending", time.time())
+        )
+        self._conn.commit()
+        return c_id
+
+    def get_pending_clarification(self) -> dict | None:
+        """Retrieves the most recent pending clarification for this session."""
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT id, original_text FROM pending_clarifications WHERE session_id = ? AND status = 'pending' ORDER BY timestamp DESC LIMIT 1", (self.session_id,))
+        row = cursor.fetchone()
+        if row:
+            return {"id": row["id"], "original_text": row["original_text"]}
+        return None
+
+    def resolve_clarification(self, clar_id: str) -> None:
+        """Marks a clarification as resolved."""
+        cursor = self._conn.cursor()
+        cursor.execute("UPDATE pending_clarifications SET status = 'resolved' WHERE id = ?", (clar_id,))
+        self._conn.commit()
             
     def export_snapshots(self, engine: MeTTaEngine) -> None:
         """Writes the current graph state to flat files for inspection."""

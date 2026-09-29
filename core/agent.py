@@ -5,6 +5,7 @@ from openai import OpenAI
 from core.metta_engine import MeTTaEngine
 from core.catalogue import EntityCatalogue
 from core.persistence import PersistenceManager
+from core.jev_adapter import JevDecisionAPI
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class NeuroSymbolicAgent:
         self.engine = engine
         self.catalogue = catalogue
         self.pm = pm
+        self.jev = JevDecisionAPI()
         
         api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
         base_url = os.environ.get("OPENAI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
@@ -262,15 +264,44 @@ class NeuroSymbolicAgent:
 
     def chat(self, messages: list, user_input: str) -> str:
         """
-        Executes the conversational loop with tool calling.
+        Executes the conversational loop with Jev intent routing and tool calling.
         messages should include the system prompt and conversation history.
         """
-        # Record the exact user utterance in the evidence ledger
-        u_id = self.pm.record_utterance(user_input)
+        # --- STAGE C: Jev API & Clarification State Machine ---
         
-        messages.append({"role": "user", "content": user_input})
+        # 1. Check for pending clarification
+        pending = self.pm.get_pending_clarification()
+        if pending:
+            # Combine the original ambiguous text with the user's clarification
+            combined_input = pending["original_text"] + " [Clarification: " + user_input + "]"
+            self.pm.resolve_clarification(pending["id"])
+            logger.info(f"Resolved clarification {pending['id']} with combined input: {combined_input}")
+            eval_input = combined_input
+            # Add to messages so Gemini sees context
+            messages.append({"role": "user", "content": eval_input})
+            u_id = self.pm.record_utterance(eval_input)
+        else:
+            eval_input = user_input
+            messages.append({"role": "user", "content": eval_input})
+            u_id = self.pm.record_utterance(eval_input)
+
+        # 2. Fast Intent Routing via Jev
+        intent = self.jev.route_intent(eval_input)
         
-        # Max 5 tool iterations to prevent infinite loops
+        if intent == "clarification":
+            # State Machine: Short-circuit LLM, go into PendingClarification
+            self.pm.record_pending_clarification(eval_input)
+            response_text = "I'm not quite sure what you mean. Could you clarify?"
+            messages.append({"role": "assistant", "content": response_text})
+            return response_text
+            
+        # Optional: Inject the Jev intent into the prompt to guide Gemini
+        messages.append({
+            "role": "system", 
+            "content": f"[JEV ROUTER] The user intent was classified as: {intent.upper()}"
+        })
+        
+        # 3. Slow Brain (Gemini) executes with tools
         for _ in range(5):
             response = self.client.chat.completions.create(
                 model=self.model,
