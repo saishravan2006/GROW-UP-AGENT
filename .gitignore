@@ -1,0 +1,16 @@
+# Data
+data/
+*.jsonl
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Env
+.env
+
+# IDE
+.vscode/
+.idea/
