@@ -24,6 +24,13 @@ You are powered by a MeTTa Knowledge Graph (AtomSpace). You do NOT know facts in
 7. You can execute multiple tools in a row.
 8. When answering a question based on `query_knowledge`, YOU MUST strictly limit your answer to the returned `answer_bindings`. Do NOT embellish, infer, or hallucinate any additional claims beyond the exact evidence provided.
 
+# Temporal Exceptions & Recurrences (Stage D)
+When the user mentions dates, recurrence, or exceptions, YOU MUST wrap the base fact in a structured temporal record:
+- For a specific date: `(ValidDate (MeetingPlace RoboticsClub Lab5) "2026-10-02")`
+- For a recurring event: `(Recurrence (MeetingPlace RoboticsClub Lab5) Weekly Friday)`
+- For a one-time exception to a recurring event: `(Exception (MeetingPlace RoboticsClub Lab5) "2026-10-09" (MeetingPlace RoboticsClub RoomB))`
+NEVER pass raw temporal text (like "next Friday") inside a normal predicate.
+
 Do NOT fabricate knowledge. If `query_knowledge` returns no results or NO_SUPPORTING_CLAIM, tell the user you don't know and ask them to teach you.
 """
 
@@ -217,7 +224,7 @@ class NeuroSymbolicAgent:
             
             predicate = m.group(1)
             
-            if predicate not in ("=", ":"):
+            if predicate not in ("=", ":", "ValidDate", "Recurrence", "Exception"):
                 known_preds = set()
                 for existing in self.engine.get_all_atoms():
                     m1 = _re.match(r"^\(\s*([a-zA-Z0-9_]+)\s", existing)
@@ -234,10 +241,13 @@ class NeuroSymbolicAgent:
             import re
             utterance_text = self.pm.get_utterance_text(user_input) or ""
             combined_text = atom + " " + utterance_text
-            if re.search(r"\b(tomorrow|next\s+\w+day|next\s+week|20\d\d|\d{1,2}/\d{1,2}/\d{2,4}|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b", combined_text, re.IGNORECASE):
+            
+            is_temporal_wrapper = predicate in ("ValidDate", "Recurrence", "Exception")
+            
+            if not is_temporal_wrapper and re.search(r"\b(tomorrow|next\s+\w+day|next\s+week|20\d\d|\d{1,2}/\d{1,2}/\d{2,4}|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b", combined_text, re.IGNORECASE):
                 return json.dumps({
                     "status": "error",
-                    "message": "VALIDATION FAILED: Unstructured temporal scope detected in utterance or atom. Temporal exceptions are unsupported in Stage A/B."
+                    "message": "VALIDATION FAILED: Temporal scope detected in utterance or atom, but you did not use a structured temporal wrapper. You MUST wrap the fact in (ValidDate ...), (Recurrence ...), or (Exception ...). Do not put raw dates in standard predicates."
                 })
             
             # Idempotent write: generate operation ID, check for duplicate
