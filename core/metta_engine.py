@@ -321,10 +321,19 @@ class _MockMeTTa:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @dataclass
+class DerivationRecord:
+    """Proof trace for a single inferred answer."""
+    answer: str                   # fully-bound result atom
+    rule_text: str                # the rule that fired (original text)
+    premises: list[str]           # ground facts that satisfied the body
+    origin: str = "derived"       # always "derived" for backward-chained results
+
+@dataclass
 class QueryResult:
     raw: list[Any]
     is_empty: bool
     formatted: str
+    derivations: list[DerivationRecord] = field(default_factory=list)
 
     @staticmethod
     def from_raw(raw_results: list[list[Any]]) -> "QueryResult":
@@ -591,63 +600,80 @@ class MeTTaEngine:
             ast, _ = parse_ast(tokenize(rule))
             if isinstance(ast, list) and len(ast) == 3 and ast[0] == "=":
                 rules.append((ast[1], ast[2]))
+        # Keep original rule text for derivation records
+        rule_texts = list(getattr(self, "_rules", []))
 
-        def solve_and(goals, bindings, depth):
+        def solve_and(goals, bindings, depth, trace):
             if not goals:
-                yield bindings
+                yield bindings, trace
                 return
             first = goals[0]
             rest = goals[1:]
-            for new_bindings in solve(first, bindings, depth):
-                yield from solve_and(rest, new_bindings, depth)
+            for new_bindings, new_trace in solve(first, bindings, depth, trace):
+                yield from solve_and(rest, new_bindings, depth, new_trace)
 
-        def solve(goal_ast, bindings, depth):
+        def solve(goal_ast, bindings, depth, trace):
             if depth > 10:
                 return
             goal_ast = substitute(goal_ast, bindings)
 
-            # Rule 2: AND Logic
+            # AND Logic
             if isinstance(goal_ast, list) and len(goal_ast) > 0 and goal_ast[0] == ',':
-                yield from solve_and(goal_ast[1:], bindings, depth)
+                yield from solve_and(goal_ast[1:], bindings, depth, trace)
                 return
 
-            # Rule 1: Literal facts
+            # Literal facts
             for fact in facts:
                 new_bindings = unify(goal_ast, fact, bindings)
                 if new_bindings is not None:
-                    yield new_bindings
+                    ground_atom = to_string(substitute(goal_ast, new_bindings))
+                    yield new_bindings, trace + [("fact", ground_atom)]
 
-            # Rule 3: Rules
-            for rule_head, rule_body in rules:
-                def refresh(ast):
+            # Rules
+            for idx, (rule_head, rule_body) in enumerate(rules):
+                def refresh(ast, _depth=depth):
                     if isinstance(ast, str) and ast.startswith('$'):
-                        return f"{ast}_{depth}"
+                        return f"{ast}_{_depth}"
                     if isinstance(ast, list):
-                        return [refresh(c) for c in ast]
+                        return [refresh(c, _depth) for c in ast]
                     return ast
                 r_head = refresh(rule_head)
                 r_body = refresh(rule_body)
-                
+
                 new_bindings = unify(goal_ast, r_head, bindings)
                 if new_bindings is not None:
-                    yield from solve(r_body, new_bindings, depth + 1)
+                    rule_src = rule_texts[idx] if idx < len(rule_texts) else "<unknown rule>"
+                    for final_bindings, sub_trace in solve(r_body, new_bindings, depth + 1, trace):
+                        yield final_bindings, sub_trace + [("rule", rule_src)]
 
         goal_ast, _ = parse_ast(tokenize(goal))
         results = []
-        for b in solve(goal_ast, {}, 0):
+        derivation_records = []
+        seen = set()
+        for b, trace in solve(goal_ast, {}, 0, []):
             res_ast = substitute(goal_ast, b)
-            results.append(to_string(res_ast))
-        
-        # Deduplicate
-        unique_results = []
-        for r in results:
-            if r not in unique_results:
-                unique_results.append(r)
-        
+            answer_str = to_string(res_ast)
+            if answer_str in seen:
+                continue
+            seen.add(answer_str)
+            results.append(answer_str)
+
+            # Build derivation record from trace
+            premise_atoms = [item for kind, item in trace if kind == "fact"]
+            applied_rules = [item for kind, item in trace if kind == "rule"]
+            if applied_rules:
+                derivation_records.append(DerivationRecord(
+                    answer=answer_str,
+                    rule_text=applied_rules[0],
+                    premises=premise_atoms,
+                    origin="derived"
+                ))
+
         return QueryResult(
-            raw=unique_results,
-            is_empty=len(unique_results) == 0,
-            formatted=", ".join(unique_results) if unique_results else "∅ (no results)"
+            raw=results,
+            is_empty=len(results) == 0,
+            formatted=", ".join(results) if results else "\u2205 (no results)",
+            derivations=derivation_records
         )
     @staticmethod
     def _split_forms(program: str) -> list[str]:

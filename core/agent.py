@@ -141,35 +141,61 @@ class NeuroSymbolicAgent:
             
         elif name == "query_knowledge":
             query = args.get("metta_query", "")
-            # Use the query itself as the template to get the fully bound atom back
             template = query
             
             result = self.engine.query(query, template)
+            used_bc = False
             if result.is_empty:
-                # Try BC
                 import re as _re
                 bc_expr = query
                 m = _re.match(r"\(match\s+&self\s+(.+?)\s+\$\w+\)$", bc_expr)
                 if m:
                     bc_expr = m.group(1)
                 result = self.engine.backward_chain(bc_expr)
+                used_bc = True
                 
             if result.is_empty:
-                return json.dumps({
-                    "status": "NO_SUPPORTING_CLAIM", 
-                    "results": []
-                })
+                return json.dumps({"status": "NO_SUPPORTING_CLAIM", "results": []})
             
-            # Map results back to claim IDs
+            # Build derivation-indexed lookup for BC results
+            derivation_map = {}
+            if used_bc:
+                for drec in result.derivations:
+                    derivation_map[drec.answer] = drec
+            
             evidence_packages = []
             for res_str in result.raw:
                 c_id = self.pm.get_claim_by_atom(res_str)
-                evidence_packages.append({
-                    "status": "ANSWERED",
-                    "answer_bindings": res_str,
-                    "supporting_claim_ids": [c_id] if c_id else [],
-                    "origin": "reported" if c_id else "derived"
-                })
+                if c_id:
+                    evidence_packages.append({
+                        "status": "ANSWERED",
+                        "answer_bindings": res_str,
+                        "supporting_claim_ids": [c_id],
+                        "origin": "reported"
+                    })
+                elif res_str in derivation_map:
+                    drec = derivation_map[res_str]
+                    premise_claim_ids = []
+                    for p in drec.premises:
+                        pid = self.pm.get_claim_by_atom(p)
+                        if pid:
+                            premise_claim_ids.append(pid)
+                    evidence_packages.append({
+                        "status": "ANSWERED",
+                        "answer_bindings": res_str,
+                        "origin": "derived",
+                        "applied_rule": drec.rule_text,
+                        "premise_claim_ids": premise_claim_ids,
+                        "premises": drec.premises
+                    })
+                else:
+                    # No claim ID and no derivation record = sync error
+                    evidence_packages.append({
+                        "status": "UNVERIFIED",
+                        "answer_bindings": res_str,
+                        "origin": "unknown",
+                        "warning": "No claim ID or derivation record found. Possible sync error."
+                    })
                 
             return json.dumps({"status": "success", "evidence": evidence_packages})
             
@@ -182,7 +208,6 @@ class NeuroSymbolicAgent:
                     "message": "VALIDATION FAILED: You must call get_schema before learning a fact to prevent predicate hallucination."
                 })
                 
-            # Additional validation: parse and validate predicate
             import re as _re
             m = _re.match(r"^\(\s*([a-zA-Z0-9_]+)\s*(.*)\)$", atom)
             if not m:
@@ -190,40 +215,41 @@ class NeuroSymbolicAgent:
             
             predicate = m.group(1)
             
-            # Allow definitions (rules or schema creations)
-            if predicate == "=" or predicate == ":":
-                pass 
-            else:
-                # Check if predicate is in known schema
+            if predicate not in ("=", ":"):
                 known_preds = set()
                 for existing in self.engine.get_all_atoms():
                     m1 = _re.match(r"^\(\s*([a-zA-Z0-9_]+)\s", existing)
-                    if m1 and m1.group(1) not in ["=", ":"]:
+                    if m1 and m1.group(1) not in ("=", ":"):
                         known_preds.add(m1.group(1))
                         
                 if predicate not in known_preds:
-                    if not predicate[0].isupper():
-                        return json.dumps({
-                            "status": "error",
-                            "message": f"VALIDATION FAILED: Predicate '{predicate}' is unknown and not PascalCase. You cannot invent this."
-                        })
+                    return json.dumps({
+                        "status": "error",
+                        "message": f"VALIDATION FAILED: Predicate '{predicate}' is not in the approved schema. Use get_schema to see approved predicates, or propose a new schema explicitly."
+                    })
             
-            # Temporal boundaries: Stage A/B prevents specific unstructured strings
+            # Temporal boundaries: check both atom AND original utterance
             import re
-            if re.search(r"\b(tomorrow|next|20\d\d|\d{1,2}/\d{1,2}/\d{2,4}|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b", atom, re.IGNORECASE):
+            utterance_text = self.pm.get_utterance_text(user_input) or ""
+            combined_text = atom + " " + utterance_text
+            if re.search(r"\b(tomorrow|next\s+\w+day|next\s+week|20\d\d|\d{1,2}/\d{1,2}/\d{2,4}|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b", combined_text, re.IGNORECASE):
                 return json.dumps({
                     "status": "error",
-                    "message": "VALIDATION FAILED: Unstructured temporal exceptions (dates, tomorrow, next) are currently unsupported in Stage A/B."
+                    "message": "VALIDATION FAILED: Unstructured temporal scope detected in utterance or atom. Temporal exceptions are unsupported in Stage A/B."
                 })
+            
+            # Idempotent write: generate operation ID, check for duplicate
+            import hashlib
+            op_id = "op_" + hashlib.sha256(f"{user_input}:{atom}:add".encode()).hexdigest()[:12]
+            if self.pm.operation_exists(op_id):
+                return json.dumps({"status": "success", "message": f"Duplicate operation {op_id} already committed. Skipped."})
                 
             self.engine.add_atom(atom)
             self.catalogue.sync(self.engine.get_all_atoms())
-            # Here user_input contains utterance_id
-            self.pm.record_modification(self.engine, user_input, atom, "add")
+            self.pm.record_modification(self.engine, user_input, atom, "add", op_id=op_id)
             
-            # Reset after successful write
             self._schema_checked = False
-            return json.dumps({"status": "success", "message": f"Learned {atom}"})
+            return json.dumps({"status": "success", "message": f"Learned {atom}", "operation_id": op_id})
             
         elif name == "retract_fact":
             atom = args.get("metta_atom", "")

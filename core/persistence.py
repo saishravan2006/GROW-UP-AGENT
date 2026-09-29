@@ -53,6 +53,7 @@ class PersistenceManager:
                 operation TEXT,
                 status TEXT,
                 timestamp REAL,
+                op_id TEXT UNIQUE,
                 FOREIGN KEY(utterance_id) REFERENCES utterances(id)
             )
         """)
@@ -91,15 +92,18 @@ class PersistenceManager:
         self._conn.commit()
         return u_id
         
-    def record_modification(self, engine: MeTTaEngine, utterance_id: str, diff_text: str, operation: str = "add") -> None:
+    def record_modification(self, engine: MeTTaEngine, utterance_id: str, diff_text: str, operation: str = "add", op_id: str = None) -> None:
         """
-        Atomically records a semantic write. 
+        Atomically records a semantic write with idempotent operation ID.
         """
         c_id = f"c_{uuid.uuid4().hex[:8]}"
+        if op_id is None:
+            import hashlib
+            op_id = "op_" + hashlib.sha256(f"{utterance_id}:{diff_text}:{operation}".encode()).hexdigest()[:12]
         cursor = self._conn.cursor()
         cursor.execute(
-            "INSERT INTO claims (id, utterance_id, metta_atom, operation, status, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-            (c_id, utterance_id, diff_text, operation, "active", time.time())
+            "INSERT INTO claims (id, utterance_id, metta_atom, operation, status, timestamp, op_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (c_id, utterance_id, diff_text, operation, "active", time.time(), op_id)
         )
         self._conn.commit()
         
@@ -115,6 +119,19 @@ class PersistenceManager:
         }
         with open(self.audit_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
+    
+    def operation_exists(self, op_id: str) -> bool:
+        """Check whether an operation ID has already been committed."""
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT 1 FROM claims WHERE op_id = ?", (op_id,))
+        return cursor.fetchone() is not None
+    
+    def get_utterance_text(self, utterance_id: str) -> str | None:
+        """Return the original text of an utterance by ID."""
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT text FROM utterances WHERE id = ?", (utterance_id,))
+        row = cursor.fetchone()
+        return row["text"] if row else None
             
     def export_snapshots(self, engine: MeTTaEngine) -> None:
         """Writes the current graph state to flat files for inspection."""
