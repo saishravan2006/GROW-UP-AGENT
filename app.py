@@ -20,7 +20,7 @@ from core.agent import NeuroSymbolicAgent, SYSTEM_PROMPT
 
 logging.basicConfig(level=logging.INFO)
 
-st.set_page_config(layout="wide", page_title="Super Memory AI - V2", page_icon="🧠")
+st.set_page_config(layout="wide", page_title="Super Memory AI - V3", page_icon="🧠")
 
 st.markdown("""
     <style>
@@ -54,7 +54,7 @@ if "initialized" not in st.session_state:
 col1, col2 = st.columns([3, 2])
 
 with col1:
-    st.title("🧠 ENI (Architecture V2)")
+    st.title("🧠 ENI (Architecture V3)")
     st.markdown("*Conversational Neuro-Symbolic Agent with strict MeTTa tool-use.*")
     st.divider()
     
@@ -71,6 +71,21 @@ with col1:
             if msg.role == "assistant" and msg.content:
                 with st.chat_message("assistant"):
                     st.markdown(msg.content)
+            elif msg.role == "tool" and msg.content:
+                try:
+                    import json
+                    parsed = json.loads(msg.content)
+                    
+                    if "evidence" in parsed:
+                        for ev in parsed["evidence"]:
+                            if ev.get("origin") == "derived":
+                                with st.expander(f"🔍 Inference Proof: {ev.get('answer_bindings')}"):
+                                    st.markdown(f"**Applied Rule:** `{ev.get('applied_rule')}`")
+                                    st.markdown("**Premises Checked:**")
+                                    for premise in ev.get("premises", []):
+                                        st.code(premise, language="lisp")
+                except Exception:
+                    pass
 
     # Chat Input
     if prompt := st.chat_input("Talk to ENI..."):
