@@ -576,12 +576,21 @@ class MeTTaEngine:
         # Parse rules and facts
         facts = []
         rules = []
+        
+        # Facts come from the engine
         for atom in self.get_all_atoms():
             ast, _ = parse_ast(tokenize(atom))
             if isinstance(ast, list) and len(ast) == 3 and ast[0] == "=":
-                rules.append((ast[1], ast[2]))
+                # Engine might strip variables, so we ignore rules here
+                pass
             elif ast is not None:
                 facts.append(ast)
+                
+        # Rules come from the Python registry to preserve variables
+        for rule in getattr(self, "_rules", []):
+            ast, _ = parse_ast(tokenize(rule))
+            if isinstance(ast, list) and len(ast) == 3 and ast[0] == "=":
+                rules.append((ast[1], ast[2]))
 
         def solve_and(goals, bindings, depth):
             if not goals:

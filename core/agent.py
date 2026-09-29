@@ -14,16 +14,16 @@ You must be conversational, quirky, and slightly eccentric.
 You are powered by a MeTTa Knowledge Graph (AtomSpace). You do NOT know facts inherently—you MUST use your tools to query the graph.
 
 # Rules for Tool Use
-1. If a user asks a question, ALWAYS use `search_entities` first to find the exact Canonical ID of the entity they are asking about.
-2. Once you have the Canonical ID, use `query_knowledge` with a valid MeTTa expression (e.g. `(Location AISecurityHackathon $x)`) to find the answer.
-3. If the user states a fact to learn or rule to define, YOU MUST ALWAYS call `get_schema` first to see the list of approved predicates and rules in the database.
-4. If a predicate already exists for that meaning (e.g. RequiresClearance), YOU MUST use it. Do not invent a new one (like Requires).
-5. Only if absolutely no relevant predicate exists in the schema, you may invent a new PascalCase predicate.
-6. Use `learn_fact` to inject it into the graph.
+1. ALWAYS use `search_entities` first to find the exact Canonical ID of any entity the user mentions.
+2. YOU MUST ALWAYS call `get_schema` BEFORE querying or learning facts to see the list of approved predicates in the database.
+3. If a predicate already exists for that meaning (e.g. MeetingPlace), YOU MUST use it. Do not invent a new one (like Location).
+4. Only if absolutely no relevant predicate exists in the schema, you may invent a new PascalCase predicate when learning.
+5. Use `query_knowledge` with the approved predicate to find answers.
+6. Use `learn_fact` with the approved predicate to inject knowledge into the graph.
 7. You can execute multiple tools in a row.
-8. Once you have the final answer or success confirmation, reply to the user naturally.
+8. When answering a question based on `query_knowledge`, YOU MUST strictly limit your answer to the returned `answer_bindings`. Do NOT embellish, infer, or hallucinate any additional claims beyond the exact evidence provided.
 
-Do NOT fabricate knowledge. If `query_knowledge` returns no results, tell the user you don't know and ask them to teach you.
+Do NOT fabricate knowledge. If `query_knowledge` returns no results or NO_SUPPORTING_CLAIM, tell the user you don't know and ask them to teach you.
 """
 
 class NeuroSymbolicAgent:
@@ -38,6 +38,7 @@ class NeuroSymbolicAgent:
         
         self.client = OpenAI(api_key=api_key, base_url=base_url)
         self.model = model
+        self._schema_checked = False
         
         self.tools = [
             {
@@ -121,6 +122,7 @@ class NeuroSymbolicAgent:
             return json.dumps({"candidates": [c.canonical_id for c in cands]})
             
         elif name == "get_schema":
+            self._schema_checked = True
             predicates = set()
             for atom in self.engine.get_all_atoms():
                 import re as _re
@@ -139,10 +141,8 @@ class NeuroSymbolicAgent:
             
         elif name == "query_knowledge":
             query = args.get("metta_query", "")
-            # Determine template by extracting variables (words starting with $)
-            import re
-            vars = re.findall(r"(\$[a-zA-Z0-9_]+)", query)
-            template = vars[-1] if vars else "$x"
+            # Use the query itself as the template to get the fully bound atom back
+            template = query
             
             result = self.engine.query(query, template)
             if result.is_empty:
@@ -155,14 +155,74 @@ class NeuroSymbolicAgent:
                 result = self.engine.backward_chain(bc_expr)
                 
             if result.is_empty:
-                return json.dumps({"status": "success", "results": []})
-            return json.dumps({"status": "success", "results": result.raw})
+                return json.dumps({
+                    "status": "NO_SUPPORTING_CLAIM", 
+                    "results": []
+                })
+            
+            # Map results back to claim IDs
+            evidence_packages = []
+            for res_str in result.raw:
+                c_id = self.pm.get_claim_by_atom(res_str)
+                evidence_packages.append({
+                    "status": "ANSWERED",
+                    "answer_bindings": res_str,
+                    "supporting_claim_ids": [c_id] if c_id else [],
+                    "origin": "reported" if c_id else "derived"
+                })
+                
+            return json.dumps({"status": "success", "evidence": evidence_packages})
             
         elif name == "learn_fact":
             atom = args.get("metta_atom", "")
+            
+            if not self._schema_checked:
+                return json.dumps({
+                    "status": "error", 
+                    "message": "VALIDATION FAILED: You must call get_schema before learning a fact to prevent predicate hallucination."
+                })
+                
+            # Additional validation: parse and validate predicate
+            import re as _re
+            m = _re.match(r"^\(\s*([a-zA-Z0-9_]+)\s*(.*)\)$", atom)
+            if not m:
+                return json.dumps({"status": "error", "message": "VALIDATION FAILED: Malformed atom. Must be (Predicate Arg1 Arg2 ...)"})
+            
+            predicate = m.group(1)
+            
+            # Allow definitions (rules or schema creations)
+            if predicate == "=" or predicate == ":":
+                pass 
+            else:
+                # Check if predicate is in known schema
+                known_preds = set()
+                for existing in self.engine.get_all_atoms():
+                    m1 = _re.match(r"^\(\s*([a-zA-Z0-9_]+)\s", existing)
+                    if m1 and m1.group(1) not in ["=", ":"]:
+                        known_preds.add(m1.group(1))
+                        
+                if predicate not in known_preds:
+                    if not predicate[0].isupper():
+                        return json.dumps({
+                            "status": "error",
+                            "message": f"VALIDATION FAILED: Predicate '{predicate}' is unknown and not PascalCase. You cannot invent this."
+                        })
+            
+            # Temporal boundaries: Stage A/B prevents specific unstructured strings
+            import re
+            if re.search(r"\b(tomorrow|next|20\d\d|\d{1,2}/\d{1,2}/\d{2,4}|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b", atom, re.IGNORECASE):
+                return json.dumps({
+                    "status": "error",
+                    "message": "VALIDATION FAILED: Unstructured temporal exceptions (dates, tomorrow, next) are currently unsupported in Stage A/B."
+                })
+                
             self.engine.add_atom(atom)
             self.catalogue.sync(self.engine.get_all_atoms())
+            # Here user_input contains utterance_id
             self.pm.record_modification(self.engine, user_input, atom, "add")
+            
+            # Reset after successful write
+            self._schema_checked = False
             return json.dumps({"status": "success", "message": f"Learned {atom}"})
             
         elif name == "retract_fact":
@@ -179,6 +239,9 @@ class NeuroSymbolicAgent:
         Executes the conversational loop with tool calling.
         messages should include the system prompt and conversation history.
         """
+        # Record the exact user utterance in the evidence ledger
+        u_id = self.pm.record_utterance(user_input)
+        
         messages.append({"role": "user", "content": user_input})
         
         # Max 5 tool iterations to prevent infinite loops
@@ -204,7 +267,7 @@ class NeuroSymbolicAgent:
                 except Exception:
                     args = {}
                     
-                tool_result_str = self._handle_tool_call(fn_name, args, user_input)
+                tool_result_str = self._handle_tool_call(fn_name, args, u_id)
                 
                 messages.append({
                     "role": "tool",

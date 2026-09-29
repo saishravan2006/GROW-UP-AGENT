@@ -1,312 +1,151 @@
-"""
-core/persistence.py
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Omega-style State Engine.
-
-Handles:
-  • AtomSpace serialisation to disk  (.metta files)
-  • Session reload from persisted state
-  • Append-only audit ledger  (audit_log.jsonl)
-  • State hashing for integrity verification
-  • Git-style unified diff generation  (before ↔ after)
-"""
-
-from __future__ import annotations
-
-import hashlib
+import sqlite3
 import json
 import logging
-import os
 import uuid
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from difflib import unified_diff
+import time
 from pathlib import Path
+from dataclasses import dataclass, field
 from typing import Any
 
 from core.metta_engine import MeTTaEngine
 
 logger = logging.getLogger(__name__)
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Audit Log Entry
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-@dataclass
-class AuditEntry:
-    """Single knowledge-modification event."""
-    timestamp: str
-    session_id: str
-    natural_language_input: str
-    extracted_metta_rule: str
-    before_state_hash: str
-    after_state_hash: str
-    diff: str
-    operation: str = "add"  # "add" | "remove" | "modify"
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "timestamp": self.timestamp,
-            "session_id": self.session_id,
-            "natural_language_input": self.natural_language_input,
-            "extracted_metta_rule": self.extracted_metta_rule,
-            "before_state_hash": self.before_state_hash,
-            "after_state_hash": self.after_state_hash,
-            "diff": self.diff,
-            "operation": self.operation,
-        }
-
-    def to_json(self) -> str:
-        return json.dumps(self.to_dict(), ensure_ascii=False)
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Diff Generator
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def compute_state_hash(snapshot: str) -> str:
-    """SHA-256 of the normalised AtomSpace snapshot."""
-    return hashlib.sha256(snapshot.encode("utf-8")).hexdigest()[:16]
-
-
-def generate_diff(before: str, after: str) -> str:
-    """
-    Produce a Git-style unified diff between two AtomSpace snapshots.
-
-    Returns a human-readable string showing added (+) and removed (-)
-    atoms with contextual headers.
-    """
-    before_lines = before.splitlines(keepends=True)
-    after_lines = after.splitlines(keepends=True)
-
-    diff_lines = list(
-        unified_diff(
-            before_lines,
-            after_lines,
-            fromfile="AtomSpace (before)",
-            tofile="AtomSpace (after)",
-            lineterm="",
-        )
-    )
-
-    if not diff_lines:
-        return "(no changes)"
-
-    return "\n".join(diff_lines)
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Persistence Manager
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
 @dataclass
 class PersistenceManager:
-    """
-    Manages the full persistence lifecycle:
-      1. Save / Load the AtomSpace to/from a .metta file
-      2. Write append-only audit log entries
-      3. Track session identity
-      4. Compute and expose diffs
-    """
-
     data_dir: Path = field(default_factory=lambda: Path("data"))
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
-    _last_snapshot: str = field(init=False, default="")
-    _last_hash: str = field(init=False, default="")
-
+    _conn: sqlite3.Connection = field(init=False, repr=False)
+    
     def __post_init__(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self._last_snapshot = ""
-        self._last_hash = compute_state_hash("")
-
-    # ── paths ──
-
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._init_db()
+        
+    @property
+    def db_path(self) -> Path:
+        return self.data_dir / "evidence_ledger.sqlite"
+        
     @property
     def kb_path(self) -> Path:
         return self.data_dir / "knowledge_base.metta"
-
+        
     @property
     def audit_path(self) -> Path:
         return self.data_dir / "audit_log.jsonl"
-
-    @property
-    def meta_path(self) -> Path:
-        return self.data_dir / "session_meta.json"
-
-    # ── knowledge base I/O ──
-
-    def save_state(self, engine: MeTTaEngine) -> str:
-        """
-        Persist the current AtomSpace to disk.
-        Returns the new state hash.
-        """
-        snapshot = engine.get_state_snapshot()
-        self.kb_path.write_text(
-            f"; Super Memory Knowledge Base\n"
-            f"; Saved: {datetime.now(timezone.utc).isoformat()}\n"
-            f"; Session: {self.session_id}\n\n"
-            + "\n".join(
-                atom for atom in sorted(engine.get_all_atoms())
+        
+    def _init_db(self):
+        cursor = self._conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS utterances (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                text TEXT,
+                timestamp REAL
             )
-            + "\n",
-            encoding="utf-8",
-        )
-
-        new_hash = compute_state_hash(snapshot)
-        self._last_snapshot = snapshot
-        self._last_hash = new_hash
-
-        # Also save session metadata
-        self.meta_path.write_text(
-            json.dumps(
-                {
-                    "session_id": self.session_id,
-                    "last_save": datetime.now(timezone.utc).isoformat(),
-                    "state_hash": new_hash,
-                    "atom_count": len(engine.get_all_atoms()),
-                },
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-
-        logger.info("State saved → %s  (hash: %s)", self.kb_path, new_hash)
-        return new_hash
-
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS claims (
+                id TEXT PRIMARY KEY,
+                utterance_id TEXT,
+                metta_atom TEXT,
+                operation TEXT,
+                status TEXT,
+                timestamp REAL,
+                FOREIGN KEY(utterance_id) REFERENCES utterances(id)
+            )
+        """)
+        self._conn.commit()
+        
     def load_state(self, engine: MeTTaEngine) -> bool:
         """
-        Reload a previously persisted AtomSpace from disk.
-        Returns True if a saved state was found and loaded.
+        Rebuilds the MeTTa engine from active claims in SQLite.
         """
-        if not self.kb_path.exists():
-            logger.info("No persisted state found at %s", self.kb_path)
-            return False
-
-        content = self.kb_path.read_text(encoding="utf-8")
-
-        # Filter out comment lines
-        lines = [
-            line.strip()
-            for line in content.splitlines()
-            if line.strip() and not line.strip().startswith(";")
-        ]
-
-        if not lines:
+        cursor = self._conn.cursor()
+        # Order by timestamp to replay history deterministically
+        cursor.execute("SELECT metta_atom, operation FROM claims WHERE status = 'active' ORDER BY timestamp ASC")
+        rows = cursor.fetchall()
+        
+        if not rows:
             logger.info("Persisted state is empty")
             return False
-
-        # Load each atom into the engine
-        for line in lines:
-            try:
-                engine.add_atom(line)
-            except Exception as e:
-                logger.warning("Failed to reload atom %r: %s", line, e)
-
-        self._last_snapshot = engine.get_state_snapshot()
-        self._last_hash = compute_state_hash(self._last_snapshot)
-
-        # Reload session metadata if available
-        if self.meta_path.exists():
-            try:
-                meta = json.loads(self.meta_path.read_text(encoding="utf-8"))
-                prev_session = meta.get("session_id", "unknown")
-                logger.info(
-                    "Loaded %d atoms from previous session %s",
-                    len(lines),
-                    prev_session,
-                )
-            except Exception:
-                pass
-
+            
+        for row in rows:
+            if row["operation"] == "add":
+                engine.add_atom(row["metta_atom"])
+            elif row["operation"] == "remove":
+                engine.remove_atom(row["metta_atom"])
+                
+        logger.info(f"Loaded {len(rows)} claims from SQLite ledger.")
         return True
-
-    def has_persisted_state(self) -> bool:
-        """Check if a .metta file exists on disk."""
-        return self.kb_path.exists() and self.kb_path.stat().st_size > 0
-
-    # ── audit logging ──
-
-    def record_modification(
-        self,
-        engine: MeTTaEngine,
-        nl_input: str,
-        metta_rule: str,
-        operation: str = "add",
-    ) -> AuditEntry:
-        """
-        Record a knowledge modification event.
-
-        1. Captures before/after snapshots
-        2. Computes diff
-        3. Appends to audit_log.jsonl
-        4. Saves state to disk
-
-        Returns the AuditEntry for UI display.
-        """
-        before_snapshot = self._last_snapshot
-        before_hash = self._last_hash
-
-        # The modification has already been applied to the engine
-        after_snapshot = engine.get_state_snapshot()
-        after_hash = compute_state_hash(after_snapshot)
-
-        diff = generate_diff(before_snapshot, after_snapshot)
-
-        entry = AuditEntry(
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            session_id=self.session_id,
-            natural_language_input=nl_input,
-            extracted_metta_rule=metta_rule,
-            before_state_hash=before_hash,
-            after_state_hash=after_hash,
-            diff=diff,
-            operation=operation,
+        
+    def record_utterance(self, text: str) -> str:
+        """Saves exact user text and returns the utterance ID."""
+        u_id = f"u_{uuid.uuid4().hex[:8]}"
+        cursor = self._conn.cursor()
+        cursor.execute(
+            "INSERT INTO utterances (id, session_id, text, timestamp) VALUES (?, ?, ?, ?)",
+            (u_id, self.session_id, text, time.time())
         )
-
-        # Append to audit log
-        with self.audit_path.open("a", encoding="utf-8") as f:
-            f.write(entry.to_json() + "\n")
-
-        # Persist full state
-        self.save_state(engine)
-
-        logger.info(
-            "Audit: %s  %s → %s  (diff: %d chars)",
-            operation,
-            before_hash,
-            after_hash,
-            len(diff),
+        self._conn.commit()
+        return u_id
+        
+    def record_modification(self, engine: MeTTaEngine, utterance_id: str, diff_text: str, operation: str = "add") -> None:
+        """
+        Atomically records a semantic write. 
+        """
+        c_id = f"c_{uuid.uuid4().hex[:8]}"
+        cursor = self._conn.cursor()
+        cursor.execute(
+            "INSERT INTO claims (id, utterance_id, metta_atom, operation, status, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+            (c_id, utterance_id, diff_text, operation, "active", time.time())
         )
-
-        return entry
-
+        self._conn.commit()
+        
+        # Export for inspection compatibility
+        self.export_snapshots(engine)
+        
+        # Also write to audit_log for UI backward compatibility during Stage A/B
+        entry = {
+            "operation": operation,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000000+00:00", time.gmtime()),
+            "user_input": f"Utterance {utterance_id}",
+            "diff": diff_text
+        }
+        with open(self.audit_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+            
+    def export_snapshots(self, engine: MeTTaEngine) -> None:
+        """Writes the current graph state to flat files for inspection."""
+        with open(self.kb_path, "w", encoding="utf-8") as f:
+            for atom in engine.get_all_atoms():
+                f.write(f"{atom}\n")
+            # Export rules too
+            for rule in getattr(engine, "_rules", []):
+                f.write(f"{rule}\n")
+                
+    def get_claim_by_atom(self, atom: str) -> str | None:
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT id FROM claims WHERE metta_atom = ? AND status = 'active' AND operation = 'add' ORDER BY timestamp DESC LIMIT 1", (atom,))
+        row = cursor.fetchone()
+        return row["id"] if row else None
+        
     def get_audit_log(self, limit: int = 50) -> list[dict[str, Any]]:
-        """Read the most recent audit entries."""
-        if not self.audit_path.exists():
-            return []
-
-        entries = []
-        for line in self.audit_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line:
-                try:
-                    entries.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-
-        return entries[-limit:]
-
-    # ── state introspection ──
-
-    @property
-    def current_hash(self) -> str:
-        return self._last_hash
-
-    @property
-    def current_snapshot(self) -> str:
-        return self._last_snapshot
-
-    def refresh_snapshot(self, engine: MeTTaEngine) -> None:
-        """Update the cached snapshot from the live engine."""
-        self._last_snapshot = engine.get_state_snapshot()
-        self._last_hash = compute_state_hash(self._last_snapshot)
+        cursor = self._conn.cursor()
+        cursor.execute("""
+            SELECT c.operation, c.timestamp, c.metta_atom, u.text as user_input 
+            FROM claims c 
+            LEFT JOIN utterances u ON c.utterance_id = u.id 
+            ORDER BY c.timestamp DESC LIMIT ?
+        """, (limit,))
+        
+        results = []
+        for row in cursor.fetchall():
+            results.append({
+                "operation": row["operation"],
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000000+00:00", time.gmtime(row["timestamp"])),
+                "user_input": row["user_input"] or "",
+                "diff": row["metta_atom"]
+            })
+        return list(reversed(results))
