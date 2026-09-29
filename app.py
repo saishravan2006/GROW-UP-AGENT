@@ -34,7 +34,7 @@ st.markdown("""
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 if "initialized" not in st.session_state:
     engine = MeTTaEngine()
-    from pathlib import Path; pm = PersistenceManager(Path(os.getcwd()))
+    from pathlib import Path; pm = PersistenceManager(Path("data"))
     pm.load_state(engine)
     
     catalogue = EntityCatalogue()
