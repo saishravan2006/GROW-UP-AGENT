@@ -505,6 +505,8 @@ class MeTTaEngine:
         Backward chaining inference engine via AST unification.
         Handles shared bindings across AND clauses and full backtracking.
         """
+        goal = sanitize_sexpr(goal)
+        
         def tokenize(expr: str) -> list[str]:
             tokens = []
             current = ""
@@ -621,6 +623,40 @@ class MeTTaEngine:
             if isinstance(goal_ast, list) and len(goal_ast) > 0 and goal_ast[0] == ',':
                 yield from solve_and(goal_ast[1:], bindings, depth, trace)
                 return
+
+            # Temporal Resolution Logic (Stage D)
+            if isinstance(goal_ast, list) and len(goal_ast) == 3 and goal_ast[0] == 'ValidDate':
+                base_fact_ast = goal_ast[1]
+                date_ast = goal_ast[2]
+                
+                # 1. Check for Exceptions where alt_fact unifies with our query fact
+                # (Exception $orig_fact "YYYY-MM-DD" $query_fact)
+                exc_goal = ['Exception', '$orig_fact_var', date_ast, base_fact_ast]
+                for exc_bindings, exc_trace in solve(exc_goal, bindings, depth + 1, trace):
+                    yield exc_bindings, exc_trace + [("rule", "Temporal Exception Override")]
+                    
+                # 2. Check for Recurrences
+                if isinstance(date_ast, str) and not date_ast.startswith('$'):
+                    date_str = date_ast.strip('"')
+                    try:
+                        import datetime
+                        dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+                        day_name = dt.strftime("%A")
+                        
+                        rec_goal = ['Recurrence', base_fact_ast, 'Weekly', day_name]
+                        for rec_bindings, rec_trace in solve(rec_goal, bindings, depth + 1, trace):
+                            # Ensure no exception overrides this specific recurrence date
+                            ground_base_fact = substitute(base_fact_ast, rec_bindings)
+                            conflict_goal = ['Exception', ground_base_fact, date_ast, '$any_alt']
+                            has_exception = False
+                            for _ in solve(conflict_goal, rec_bindings, depth + 1, []):
+                                has_exception = True
+                                break
+                                
+                            if not has_exception:
+                                yield rec_bindings, rec_trace + [("rule", "Temporal Recurrence Resolution")]
+                    except ValueError:
+                        pass
 
             # Literal facts
             for fact in facts:
