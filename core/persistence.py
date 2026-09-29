@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class PersistenceManager:
     data_dir: Path = field(default_factory=lambda: Path("data"))
+    filename: str = field(default_factory=lambda: "evidence_ledger.sqlite")
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     _conn: sqlite3.Connection = field(init=False, repr=False)
     
@@ -25,7 +26,7 @@ class PersistenceManager:
         
     @property
     def db_path(self) -> Path:
-        return self.data_dir / "evidence_ledger.sqlite"
+        return self.data_dir / self.filename
         
     @property
     def kb_path(self) -> Path:
