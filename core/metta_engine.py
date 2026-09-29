@@ -493,151 +493,153 @@ class MeTTaEngine:
 
     def backward_chain(self, goal: str) -> QueryResult:
         """
-        Backward chaining inference engine.
-        
-        Hyperon v0.2.x doesn't auto-reduce (= ...) definitions through match,
-        so we implement the backward chainer in Python using the native space API.
-        
-        The three rules:
-          1. Base case: if the goal is a literal fact in &self, return it.
-          2. AND case: if the goal is (, A B), solve A then B.
-          3. Rule unroll: if there's a (= goal body) in &self, substitute and solve body.
+        Backward chaining inference engine via AST unification.
+        Handles shared bindings across AND clauses and full backtracking.
         """
-        results = self._bc_solve(goal, depth=0)
-        flat = [str(r) for r in results if r]
-        return QueryResult(raw=flat, is_empty=len(flat) == 0,
-                           formatted=", ".join(flat) if flat else "∅ (no results)")
+        def tokenize(expr: str) -> list[str]:
+            tokens = []
+            current = ""
+            for ch in expr:
+                if ch in "() \n\t":
+                    if current:
+                        tokens.append(current)
+                        current = ""
+                    if ch in "()":
+                        tokens.append(ch)
+                else:
+                    current += ch
+            if current:
+                tokens.append(current)
+            return tokens
 
-    def _bc_solve(self, goal: str, depth: int = 0) -> list[str]:
-        """Recursive backward chaining solver."""
-        if depth > 10:
-            return []  # Prevent infinite recursion
-
-        goal = goal.strip()
-
-        # Rule 2: AND Logic — (, A B)
-        if goal.startswith("(,") or goal.startswith("( ,"):
-            parts = self._split_and_goals(goal)
-            if parts:
-                # All sub-goals must succeed
-                all_results = []
-                for part in parts:
-                    sub = self._bc_solve(part, depth + 1)
-                    if not sub:
-                        return []  # AND fails if any sub-goal fails
-                    all_results.extend(sub)
-                return all_results if all_results else []
-
-        # Rule 1: Base case — is this a literal fact in the space?
-        direct = self.query(goal, goal)
-        if not direct.is_empty:
-            return direct.raw
-
-        # Rule 3: Rule Unrolling — find (= goal body) in Python-side registry and solve body
-        for rule in self._rules:
-            rule_match = self._match_rule(rule, goal)
-            if rule_match is not None:
-                body = rule_match
-                logger.info("BC[%d]: Unrolled rule → body: %s", depth, body)
-                result = self._bc_solve(body, depth + 1)
-                if result:
-                    return result
-
-        return []
-
-    def _match_rule(self, rule_atom: str, goal: str) -> str | None:
-        """
-        Given a rule like (= (CanAccess $user $lab) (, (Req $lab $lvl) (Has $user $lvl)))
-        and a goal like (CanAccess Anush TechParkLab3),
-        check if the head unifies with the goal and return the substituted body.
-        """
-        # Strip outer (= ...)
-        inner = rule_atom[3:-1].strip()  # Remove "(= " and ")"
-        
-        # Split into head and body at the top level
-        head, body = self._split_head_body(inner)
-        if head is None:
-            return None
-
-        # Tokenise head and goal
-        head_tokens = self._tokenise_flat(head)
-        goal_tokens = self._tokenise_flat(goal)
-
-        if len(head_tokens) != len(goal_tokens):
-            return None
-
-        # Build variable bindings
-        bindings: dict[str, str] = {}
-        for h, g in zip(head_tokens, goal_tokens):
-            if h.startswith("$"):
-                if h in bindings and bindings[h] != g:
-                    return None  # Conflict
-                bindings[h] = g
-            elif h != g:
-                return None  # Literal mismatch
-
-        # Substitute bindings into body
-        result = body
-        for var, val in bindings.items():
-            result = result.replace(var, val)
-        return result
-
-    def _split_head_body(self, inner: str) -> tuple[str | None, str | None]:
-        """Split '(Head args) Body' into head and body at the top-level."""
-        depth = 0
-        for i, ch in enumerate(inner):
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-                if depth == 0:
-                    head = inner[:i+1].strip()
-                    body = inner[i+1:].strip()
-                    return head, body
-        return None, None
-
-    def _tokenise_flat(self, expr: str) -> list[str]:
-        """Tokenise a flat S-expression like (Pred Arg1 Arg2) into ['Pred', 'Arg1', 'Arg2']."""
-        stripped = expr.strip()
-        if stripped.startswith("(") and stripped.endswith(")"):
-            stripped = stripped[1:-1].strip()
-        return stripped.split()
-
-    def _split_and_goals(self, expr: str) -> list[str] | None:
-        """Split (, (A) (B)) into ['(A)', '(B)']."""
-        # Remove outer (, ... )
-        inner = expr.strip()
-        if inner.startswith("(,"):
-            inner = inner[2:]
-        elif inner.startswith("( ,"):
-            inner = inner[3:]
-        else:
-            return None
-        if inner.endswith(")"):
-            inner = inner[:-1]
-        inner = inner.strip()
-
-        # Split by top-level parenthesised groups
-        parts = []
-        depth = 0
-        current = ""
-        for ch in inner:
-            if ch == "(":
-                depth += 1
-                current += ch
-            elif ch == ")":
-                depth -= 1
-                current += ch
-                if depth == 0:
-                    parts.append(current.strip())
-                    current = ""
+        def parse_ast(tokens: list[str]):
+            if not tokens:
+                return None, []
+            t = tokens.pop(0)
+            if t == '(':
+                lst = []
+                while tokens and tokens[0] != ')':
+                    item, tokens = parse_ast(tokens)
+                    lst.append(item)
+                if tokens:
+                    tokens.pop(0)
+                return lst, tokens
+            elif t == ')':
+                raise ValueError("Unexpected ')'")
             else:
-                current += ch
-        remainder = current.strip()
-        if remainder:
-            parts.append(remainder)
-        return parts if parts else None
+                return t, tokens
 
+        def substitute(ast, bindings):
+            if isinstance(ast, str) and ast.startswith('$'):
+                if ast in bindings:
+                    return substitute(bindings[ast], bindings)
+                return ast
+            if isinstance(ast, list):
+                return [substitute(child, bindings) for child in ast]
+            return ast
+
+        def to_string(ast):
+            if isinstance(ast, str):
+                return ast
+            return "(" + " ".join(to_string(child) for child in ast) + ")"
+
+        def unify(ast1, ast2, bindings):
+            bindings = bindings.copy()
+            if isinstance(ast1, str) and ast1.startswith('$'):
+                if ast1 in bindings:
+                    return unify(bindings[ast1], ast2, bindings)
+                else:
+                    bindings[ast1] = ast2
+                    return bindings
+            if isinstance(ast2, str) and ast2.startswith('$'):
+                if ast2 in bindings:
+                    return unify(ast1, bindings[ast2], bindings)
+                else:
+                    bindings[ast2] = ast1
+                    return bindings
+            
+            if isinstance(ast1, str) and isinstance(ast2, str):
+                if ast1 == ast2:
+                    return bindings
+                return None
+            
+            if isinstance(ast1, list) and isinstance(ast2, list):
+                if len(ast1) != len(ast2):
+                    return None
+                for c1, c2 in zip(ast1, ast2):
+                    bindings = unify(c1, c2, bindings)
+                    if bindings is None:
+                        return None
+                return bindings
+            return None
+
+        # Parse rules and facts
+        facts = []
+        rules = []
+        for atom in self.get_all_atoms():
+            ast, _ = parse_ast(tokenize(atom))
+            if isinstance(ast, list) and len(ast) == 3 and ast[0] == "=":
+                rules.append((ast[1], ast[2]))
+            elif ast is not None:
+                facts.append(ast)
+
+        def solve_and(goals, bindings, depth):
+            if not goals:
+                yield bindings
+                return
+            first = goals[0]
+            rest = goals[1:]
+            for new_bindings in solve(first, bindings, depth):
+                yield from solve_and(rest, new_bindings, depth)
+
+        def solve(goal_ast, bindings, depth):
+            if depth > 10:
+                return
+            goal_ast = substitute(goal_ast, bindings)
+
+            # Rule 2: AND Logic
+            if isinstance(goal_ast, list) and len(goal_ast) > 0 and goal_ast[0] == ',':
+                yield from solve_and(goal_ast[1:], bindings, depth)
+                return
+
+            # Rule 1: Literal facts
+            for fact in facts:
+                new_bindings = unify(goal_ast, fact, bindings)
+                if new_bindings is not None:
+                    yield new_bindings
+
+            # Rule 3: Rules
+            for rule_head, rule_body in rules:
+                def refresh(ast):
+                    if isinstance(ast, str) and ast.startswith('$'):
+                        return f"{ast}_{depth}"
+                    if isinstance(ast, list):
+                        return [refresh(c) for c in ast]
+                    return ast
+                r_head = refresh(rule_head)
+                r_body = refresh(rule_body)
+                
+                new_bindings = unify(goal_ast, r_head, bindings)
+                if new_bindings is not None:
+                    yield from solve(r_body, new_bindings, depth + 1)
+
+        goal_ast, _ = parse_ast(tokenize(goal))
+        results = []
+        for b in solve(goal_ast, {}, 0):
+            res_ast = substitute(goal_ast, b)
+            results.append(to_string(res_ast))
+        
+        # Deduplicate
+        unique_results = []
+        for r in results:
+            if r not in unique_results:
+                unique_results.append(r)
+        
+        return QueryResult(
+            raw=unique_results,
+            is_empty=len(unique_results) == 0,
+            formatted=", ".join(unique_results) if unique_results else "∅ (no results)"
+        )
     @staticmethod
     def _split_forms(program: str) -> list[str]:
         # Strip MeTTa comments before parsing to prevent ghost word injection

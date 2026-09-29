@@ -63,6 +63,15 @@ class MeTTaTranslation(BaseModel):
         description="Confidence score 0-1 for the translation",
     )
 
+class ClarificationPayload(BaseModel):
+    """Returned when the request is ambiguous and needs clarification."""
+    intent: IntentType = Field(default=IntentType.CLARIFICATION)
+    message: str = Field(description="The clarification question to ask the user")
+    pending_request: str = Field(description="The original ambiguous request string")
+    candidates: list[str] = Field(description="List of Candidate IDs that matched")
+    resolved_slots: dict[str, str] = Field(default_factory=dict, description="Concepts that were successfully resolved")
+    unresolved_slots: list[str] = Field(default_factory=list, description="Concepts that are ambiguous")
+
 
 class UncertaintyPayload(BaseModel):
     """Returned when the AtomSpace has no answer."""
@@ -126,17 +135,58 @@ class Jev:
     # ── Step 1: Intent Router ──────────────────────────────────
 
     @classmethod
-    def route_intent(cls, text: str) -> IntentType:
+    def route_intent(cls, text: str, catalogue, pending) -> tuple[IntentType, list, list]:
         """
-        Step 1: Structured 'Choice' evaluation.
-        Uses Typesafe Jev when available; local heuristics otherwise.
+        Step 1: Returns IntentType, list of resolved Candidates, list of unresolved canonical strings.
         """
-        if cls._ensure_client():
-            try:
-                return cls._jev_route_intent(text)
-            except Exception as e:
-                logger.warning("Jev API intent routing failed (%s), falling back", e)
-        return cls._local_route_intent(text)
+        if pending and pending.candidates:
+            lower = text.lower().strip()
+            # Handle "the second one", "the first one", etc.
+            resolved = None
+            if "first" in lower or lower == "1":
+                resolved = [c for c in catalogue.candidates.values() if c.canonical_id == pending.candidates[0]]
+            elif "second" in lower or lower == "2":
+                if len(pending.candidates) > 1:
+                    resolved = [c for c in catalogue.candidates.values() if c.canonical_id == pending.candidates[1]]
+            else:
+                for c in pending.candidates:
+                    if c.lower() in lower:
+                        resolved = [cand for cand in catalogue.candidates.values() if cand.canonical_id == c]
+                        break
+            if resolved:
+                orig_intent = cls._local_route_intent(pending.pending_request)
+                return orig_intent, resolved, []
+
+        intent = cls._local_route_intent(text)
+        if intent in (IntentType.CONVERSATION, IntentType.CLARIFICATION):
+            return intent, [], []
+
+        # Assertions (teaching) accept unknown entities freely
+        if intent == IntentType.ASSERTION:
+            return intent, [], []
+
+        # Find unresolved candidates
+        resolved = []
+        unresolved = []
+        
+        if catalogue:
+            candidates = catalogue.search(text)
+            words = set(re.sub(r'[^\w\s]', '', text.lower()).split())
+            
+            for c in candidates:
+                if c.display_label.lower() in text.lower() or c.canonical_id.lower() in text.lower() or any(a.lower() in text.lower() for a in c.aliases):
+                    resolved.append(c)
+                    
+            for w in words:
+                if len(w) > 4:
+                    matches = [c for c in candidates if w in c.canonical_id.lower() or w in c.display_label.lower() or any(w in a.lower() for a in c.aliases)]
+                    if len(matches) > 1 and not any(m in resolved for m in matches):
+                        unresolved.extend([m.canonical_id for m in matches])
+
+        if unresolved:
+            return IntentType.CLARIFICATION, [], list(set(unresolved))
+            
+        return intent, resolved, []
 
     @classmethod
     def _jev_route_intent(cls, text: str) -> IntentType:
@@ -411,14 +461,28 @@ class LLMTranslator:
 
     # ── primary translation ──
 
-    def translate(self, user_input: str) -> MeTTaTranslation:
+    def translate(self, user_input: str, catalogue=None, pending=None):
         """Execute the Jev Fast/Slow Translation loop with input normalization."""
-        # Strip leading/trailing whitespace, quotes, and punctuation
         clean_input = user_input.strip(' "\'').replace('?', '').strip()
 
+        intent, resolved_cands, unresolved_strings = Jev.route_intent(clean_input, catalogue, pending)
+
+        if intent == IntentType.CLARIFICATION:
+            original_req = pending.pending_request if pending else clean_input
+            return ClarificationPayload(
+                message="Which one do you mean?",
+                pending_request=original_req,
+                candidates=unresolved_strings,
+                unresolved_slots=["target"]
+            )
+            
+        if intent == IntentType.CONVERSATION:
+            return MeTTaTranslation(intent=intent, verbal_reasoning="I am listening.", confidence=1.0)
+
+        # Let the compiler handle query if we have no unresolved but also no resolved
         if self._use_fallback:
-            return self._fallback_translate(clean_input)
-        return self._llm_translate(clean_input)
+            return self._fallback_translate(clean_input, intent, resolved_cands)
+        return self._llm_translate(clean_input, intent, resolved_cands, pending)
 
     def generate_answer(
         self,
@@ -437,26 +501,21 @@ class LLMTranslator:
     # DeepSeek R1 / OpenRouter Loop
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    def _llm_translate(self, user_input: str) -> MeTTaTranslation:
+    def _llm_translate(self, user_input: str, intent: IntentType, resolved_cands: list, pending) -> MeTTaTranslation | UncertaintyPayload:
         """
         The "Fast/Slow" Neuro-Symbolic Loop.
         """
-        # Step 1: Jev (The Front Door / Fast Intent Router)
-        intent = Jev.route_intent(user_input)
-        logger.info("Jev routed intent: %s", intent.value)
 
-        if intent in (IntentType.CONVERSATION, IntentType.CLARIFICATION):
-            return MeTTaTranslation(
-                intent=intent,
-                verbal_reasoning="I am listening.",
-            )
 
         # Step 2: OpenRouter / DeepSeek R1 (The Slow Translator acting as compiler)
         prompt = (
             f"Intent Category: {intent.value}\n"
-            f"User input text: {user_input}\n\n"
-            f"Output ONLY the corresponding MeTTa code enclosed in parentheses."
+            f"User input text: {pending.pending_request if pending else user_input}\n"
         )
+        if resolved_cands:
+            symbols = ", ".join([c.canonical_id for c in resolved_cands])
+            prompt += f"Use ONLY these verified graph symbols: {symbols}\n"
+        prompt += "\nOutput ONLY the corresponding MeTTa code enclosed in parentheses."
 
         max_retries = 2
         for attempt in range(max_retries + 1):
@@ -464,7 +523,7 @@ class LLMTranslator:
                 response = self._client.chat.completions.create(
                     model=self.model,
                     messages=[
-                        {"role": "system", "content": COMPILER_SYSTEM_PROMPT},
+                        {"role": "system", "content": COMPILER_SYSTEM_PROMPT + "\nYou are provided with verified graph symbols. You MUST use these exact symbols. Do not invent symbols for known entities."},
                         {"role": "user", "content": prompt},
                     ],
                     temperature=0.0,
@@ -510,7 +569,7 @@ class LLMTranslator:
             return self._ollama_translate(user_input, intent)
         except Exception as e:
             logger.error("Ollama fallback failed: %s. Using regex heuristic.", e)
-            return self._fallback_translate(user_input)
+            return self._fallback_translate(user_input, intent, resolved_cands)
 
     def _ollama_translate(self, user_input: str, intent: IntentType) -> MeTTaTranslation:
         """Fallback to local Ollama model."""
@@ -596,12 +655,10 @@ class LLMTranslator:
     # Regex Fallback (offline / no API key)
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-    def _fallback_translate(self, user_input: str) -> MeTTaTranslation:
+    def _fallback_translate(self, user_input: str, intent: IntentType, resolved_cands: list) -> MeTTaTranslation | UncertaintyPayload:
         """
         Heuristic NL → MeTTa translator.
-        Uses Jev for intent, then regexes for the compilation.
         """
-        intent = Jev.route_intent(user_input)
         text = user_input.strip()
 
         if intent == IntentType.QUERY:

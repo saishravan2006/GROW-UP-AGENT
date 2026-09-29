@@ -146,8 +146,15 @@ def init_session():
     if "persistence" not in st.session_state:
         st.session_state.persistence = PersistenceManager()
 
+    if "catalogue" not in st.session_state:
+        from core.catalogue import EntityCatalogue
+        st.session_state.catalogue = EntityCatalogue()
+
     if "translator" not in st.session_state:
         st.session_state.translator = LLMTranslator()
+        
+    if "pending_request" not in st.session_state:
+        st.session_state.pending_request = None
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -231,14 +238,37 @@ def process_input(user_input: str):
     engine: MeTTaEngine = st.session_state.engine
     pm: PersistenceManager = st.session_state.persistence
     translator: LLMTranslator = st.session_state.translator
+    catalogue = st.session_state.catalogue
+    catalogue.sync(engine.get_all_atoms())
 
     # Step 1: Translate
-    translation: MeTTaTranslation = translator.translate(user_input)
+    translation = translator.translate(user_input, catalogue, st.session_state.pending_request)
+
+    if hasattr(translation, "missing_concepts"):
+        # UncertaintyPayload
+        st.session_state.pending_request = None
+        return (
+            f"❓ {translation.message}\n\n"
+            f"Missing concepts: `{', '.join(translation.missing_concepts)}`\n\n"
+            f"💡 {translation.suggested_input}"
+        )
+
+    if translation.intent == IntentType.CLARIFICATION:
+        st.session_state.pending_request = translation
+        cands_str = "\n".join(f"- {c}" for c in translation.candidates)
+        return (
+            f"🤔 **Clarification needed:** {translation.message}\n\n"
+            f"Multiple possibilities found for your request:\n{cands_str}\n\n"
+            f"*(Type your selection below, e.g. 'the first one' or the exact name)*"
+        )
+        
+    st.session_state.pending_request = None
 
     if translation.intent == IntentType.ASSERTION:
         # ── Learn a new fact ──
         before_snapshot = engine.get_state_snapshot()
         engine.add_atom(translation.metta_expression)
+        catalogue.sync(engine.get_all_atoms())
 
         # Record & persist
         entry = pm.record_modification(
@@ -305,6 +335,7 @@ def process_input(user_input: str):
     elif translation.intent == IntentType.RETRACTION:
         # ── Remove a fact ──
         engine.remove_atom(translation.metta_expression)
+        catalogue.sync(engine.get_all_atoms())
 
         entry = pm.record_modification(
             engine, user_input, translation.metta_expression, "remove"
